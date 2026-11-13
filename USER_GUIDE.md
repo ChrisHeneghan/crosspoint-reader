@@ -396,6 +396,10 @@ CrossPoint supports saving multiple OPDS servers and switching between them when
 Behavior notes:
 
 - You can store up to 8 OPDS servers.
+- Catalog browsing requires a writable SD card. The reader temporarily saves one server response before parsing it.
+- Large feeds may show an entry range and **More entries available**. **Next** reads the next range from the saved response, then follows the server's next-page link after finishing it. **Previous** and **Back** recompute earlier local ranges from the saved response. Backward navigation may take longer than Next. Entry counts can vary with metadata size.
+- Back history keeps at most 16 recent server/category transitions, with less history for long URLs or searches. Local ranges do not consume history. At the first local range, Back returns home once this history is exhausted; Previous can still follow links advertised by the server.
+- Returning to another server page downloads it again. If the catalog changes between downloads, entries can be skipped or repeated. Retry downloads a fresh response and starts at its first range.
 - OPDS authentication supports HTTP Basic auth. If you use Calibre Content Server with authentication enabled, set it to Basic (not Digest).
 
 You can also manage OPDS servers from the web interface while in File Transfer mode:

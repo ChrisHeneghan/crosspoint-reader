@@ -119,6 +119,7 @@ bool HttpDownloader::fetchUrl(const std::string& url, const DataCallback& onData
   const std::string startOrigin = freeink::fetchOrigin(url);
   int status = 0;
   bool sinkStopped = false;
+  bool complete = false;
   for (int hop = 0; hop <= MAX_REDIRECTS; ++hop) {
     freeink::SecureHttpClient http;
     if (!http.begin(current)) {
@@ -151,6 +152,7 @@ bool HttpDownloader::fetchUrl(const std::string& url, const DataCallback& onData
       }
       return true;
     });
+    complete = http.responseComplete();
     if (status == 301 || status == 302 || status == 303 || status == 307 || status == 308) {
       const std::string location = http.getHeader("location");
       if (location.empty() || !freeink::SecureHttpClient::resolveUrl(current, location, current)) break;
@@ -161,7 +163,8 @@ bool HttpDownloader::fetchUrl(const std::string& url, const DataCallback& onData
   g_lastStatus = status > 0 ? status : 0;
   g_lastRedirected = freeink::fetchOrigin(current) != startOrigin;
   if (options.statusOut) *options.statusOut = g_lastStatus;
-  return status >= 200 && status < 300 && !sinkStopped;
+  if (!complete && !sinkStopped) LOG_ERR("HTTP", "Incomplete response: %s", current.c_str());
+  return status >= 200 && status < 300 && complete && !sinkStopped;
 }
 
 bool HttpDownloader::postForm(const std::string& url, const std::string& formBody, std::string& outResponse,
