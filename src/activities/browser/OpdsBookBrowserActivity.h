@@ -30,12 +30,30 @@ class OpdsBookBrowserActivity final : public CatalogActivity {
   static constexpr freeink::ui::ActionId ACTION_PAGE = ACTION_USER + 2;
 
   std::vector<OpdsEntry> entries;
+  std::vector<OpdsEntry> supplementaryEntries;
+  size_t entryCount() const { return entries.size() + supplementaryEntries.size(); }
+  const OpdsEntry& entryAt(size_t index) const {
+    return index < entries.size() ? entries[index] : supplementaryEntries[index - entries.size()];
+  }
   // Row buffer, built whenever entries changes (fetchFeed()/releaseEntries())
   // so buildBrowsingScreen() reuses it on every repaint instead of rebuilding
   // a ListItem vector per render.
   std::vector<freeink::ui::ListItem> rowItems;
-  void rebuildRowItems();
-  std::vector<std::string> navigationHistory;
+  bool rebuildRowItems();
+  struct BrowsePosition {
+    std::string path;
+    std::string query;
+    OpdsWindowRequest window;
+    bool forwardPage = false;
+  };
+  static constexpr size_t MAX_NAVIGATION_HISTORY = 16;
+  static constexpr size_t MAX_HISTORY_BYTES = 8 * 1024;
+  std::vector<BrowsePosition> navigationHistory;
+  OpdsWindowRequest feedWindow;
+  size_t nextEntryOffset = 0;
+  bool moreFeedEntries = false;
+  size_t visibleEntryStart = 0;
+  bool previousWindowAvailable = false;
   std::string currentPath;
   // The active search query. While browsing its results the header shows it
   // (quoted, library-view convention) instead of the server name, and
@@ -43,9 +61,6 @@ class OpdsBookBrowserActivity final : public CatalogActivity {
   std::string searchQuery;
   // Quoted form of searchQuery for the header; derived by setSearchQuery().
   std::string headerSearchTitle;
-  // searchQuery per navigationHistory entry, pushed/popped in lockstep, so
-  // Back restores the search term (or its absence) of the feed it returns to.
-  std::vector<std::string> searchQueryHistory;
   // Raw pagination hrefs of the current feed: following them keeps the
   // search-term header (page 2 of results is still the same search).
   std::string pageNextHref;
@@ -86,13 +101,14 @@ class OpdsBookBrowserActivity final : public CatalogActivity {
   freeink::opds::OpdsClient opdsClient{opdsTransport};
 
   // --- CatalogActivity / UiListActivity contract -----------------------------
-  int listCount() const override { return state == State::BROWSING ? static_cast<int>(entries.size()) : 0; }
+  int listCount() const override { return state == State::BROWSING ? static_cast<int>(entryCount()) : 0; }
   bool hasSearch() const override { return !searchTemplate.empty() || !searchDescriptionUrl.empty(); }
   std::string searchPrefill() const override { return searchQuery; }
   void activateIndex(int index) override;
   void buildScreen(UiScreen& screen) override;
   void drawFooter() override;
   void startBrowse() override;
+  void retryBrowse() override;
   void downloadFinished(bool cancelled) override;
   void performSearch(const std::string& query) override;
   void onBackButton() override;
@@ -103,7 +119,12 @@ class OpdsBookBrowserActivity final : public CatalogActivity {
   // Bottom pagination tab bar (arrow icons); drawn only when the feed
   // advertises next/previous/first/last links.
   void buildPaginationBar(UiScreen& screen);
-  void followPageLink(const std::string& href);
+  void followPageLink(const std::string& href, bool forwardPage, OpdsWindowMode mode = OpdsWindowMode::Forward);
+  void nextPage();
+  void previousPage();
+  bool hasNextPage() const { return moreFeedEntries || !pageNextHref.empty(); }
+  bool hasPreviousPage() const { return previousWindowAvailable || !pagePrevHref.empty(); }
+  bool savePosition(bool forwardPage);
   void buildBrowsingScreen(UiScreen& screen);
   static void onPageEvent(const freeink::ui::ActionEvent& event, void* user);
 
@@ -130,8 +151,10 @@ class OpdsBookBrowserActivity final : public CatalogActivity {
   std::string pendingLcpPath;
 
   void fetchFeed(const std::string& path);
+  freeink::opds::OpdsClient::FetchStatus fetchWindow(const std::string& url, OpdsWindowRequest& request,
+                                                     OpdsFeedParser& parser);
   void releaseEntries();
-  void navigateToEntry(const OpdsEntry& entry);
+  void navigateToEntry(const OpdsEntry& entry, bool forwardPage = false, OpdsWindowMode mode = OpdsWindowMode::Forward);
   void navigateBack();
   void downloadBook(const OpdsEntry& book);
   void openPublicationDetail(const OpdsEntry& entry);

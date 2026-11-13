@@ -4,6 +4,7 @@
 #include <FontCacheManager.h>
 #include <FreeInkUIIcon.h>
 #include <GfxRenderer.h>
+#include <HalMemory.h>
 #include <HalStorage.h>
 #include <I18n.h>
 #include <LcpLicense.h>
@@ -17,7 +18,7 @@
 #include <Util.h>
 #include <WolfsslCrypto.h>
 
-#include <iterator>
+#include <algorithm>
 
 #include "BookKey.h"
 #include "CrossPointSettings.h"
@@ -97,6 +98,10 @@ void OpdsBookBrowserActivity::onEnter() {
   opdsClient.setAcceptLanguage(uiAcceptLanguage());
   opdsClient.onStatus(&OpdsBookBrowserActivity::onClientStatus, this);
 
+  if (!opdsTransport.invalidateFeed()) {
+    fail(StrId::STR_OPDS_FEED_STORAGE_ERROR);
+    return;
+  }
   state = State::CHECK_WIFI;
   statusMessage = tr(STR_CHECKING_WIFI);
   checkAndConnectWifi();
@@ -104,6 +109,7 @@ void OpdsBookBrowserActivity::onEnter() {
 
 void OpdsBookBrowserActivity::onExit() {
   releaseEntries();
+  opdsTransport.invalidateFeed();
   navigationHistory.clear();
   if (!detailCoverPath.empty()) {
     if (Storage.exists(detailCoverPath.c_str())) Storage.remove(detailCoverPath.c_str());
@@ -114,23 +120,23 @@ void OpdsBookBrowserActivity::onExit() {
 
 void OpdsBookBrowserActivity::activateIndex(const int index) {
   app.clearTapFlash();
-  const auto& entry = entries[index];
+  const auto& entry = entryAt(index);
   entry.type == OpdsEntryType::BOOK ? openPublicationDetail(entry) : navigateToEntry(entry);
 }
 
 bool OpdsBookBrowserActivity::handleCustomInput() {
   if (state == State::BROWSING &&
-      (!pageNextHref.empty() || !pagePrevHref.empty() || !pageFirstHref.empty() || !pageLastHref.empty())) {
+      (hasNextPage() || hasPreviousPage() || !pageFirstHref.empty() || !pageLastHref.empty())) {
     // On a paginated feed the side buttons belong to feed pages exclusively.
     // NavNext/NavPrevious resolve to the side buttons too, so every side
     // press/hold pass is swallowed here or the shared list nav would also
     // step the selection under the same physical button.
     if (mappedInput.wasReleased(MappedInputManager::Button::PageForward)) {
-      if (!pageNextHref.empty()) followPageLink(pageNextHref);
+      if (hasNextPage()) nextPage();
       return true;
     }
     if (mappedInput.wasReleased(MappedInputManager::Button::PageBack)) {
-      if (!pagePrevHref.empty()) followPageLink(pagePrevHref);
+      if (hasPreviousPage()) previousPage();
       return true;
     }
     if (mappedInput.isPressed(MappedInputManager::Button::PageForward) ||
@@ -151,27 +157,86 @@ void OpdsBookBrowserActivity::onPageEvent(const fui::ActionEvent& event, void* u
       href = &self->pageFirstHref;
       break;
     case PAGE_PREV:
-      href = &self->pagePrevHref;
-      break;
+      if (self->hasPreviousPage()) self->previousPage();
+      return;
     case PAGE_NEXT:
-      href = &self->pageNextHref;
-      break;
+      if (self->hasNextPage()) self->nextPage();
+      return;
     case PAGE_LAST:
       href = &self->pageLastHref;
       break;
     default:
       return;
   }
-  if (href && !href->empty()) self->followPageLink(*href);
+  if (href && !href->empty()) self->followPageLink(*href, false);
 }
 
 // Follow a pagination link. isPaginationHref() keeps the search-term header
 // across page turns; navigateToEntry() does the history push and fetch.
-void OpdsBookBrowserActivity::followPageLink(const std::string& href) {
+void OpdsBookBrowserActivity::followPageLink(const std::string& href, bool forwardPage, OpdsWindowMode mode) {
   OpdsEntry entry;
   entry.type = OpdsEntryType::NAVIGATION;
   entry.href = href;
-  navigateToEntry(entry);
+  navigateToEntry(entry, forwardPage, mode);
+}
+
+bool OpdsBookBrowserActivity::savePosition(bool forwardPage) {
+  constexpr size_t overhead = 32;
+  const size_t reservedBytes = MAX_NAVIGATION_HISTORY * sizeof(BrowsePosition) + overhead;
+  const size_t stringBytes = 2 * (currentPath.size() + searchQuery.size() + 2 + sizeof(std::string) + overhead);
+  if (reservedBytes + stringBytes > MAX_HISTORY_BYTES) {
+    LOG_ERR("OPDS", "Navigation position exceeds history budget");
+    fail(StrId::STR_MEMORY_ERROR);
+    return false;
+  }
+  const size_t vectorBytes =
+      navigationHistory.capacity() < MAX_NAVIGATION_HISTORY ? MAX_NAVIGATION_HISTORY * sizeof(BrowsePosition) : 0;
+  for (const auto heap : {HalMemory::getDefaultHeap(), HalMemory::getInternalHeap()}) {
+    if (heap.freeBytes <= vectorBytes + stringBytes + 2048 ||
+        heap.largestBlockBytes < std::max(vectorBytes, stringBytes)) {
+      LOG_ERR("OPDS", "Insufficient navigation memory: %u bytes", static_cast<unsigned>(vectorBytes + stringBytes));
+      fail(StrId::STR_MEMORY_ERROR);
+      return false;
+    }
+  }
+  size_t bytes = reservedBytes + stringBytes;
+  for (const auto& position : navigationHistory)
+    bytes += position.path.capacity() + position.query.capacity() + 2 + 2 * overhead;
+  while (!navigationHistory.empty() &&
+         (navigationHistory.size() == MAX_NAVIGATION_HISTORY || bytes > MAX_HISTORY_BYTES)) {
+    const auto& oldest = navigationHistory.front();
+    bytes -= oldest.path.capacity() + oldest.query.capacity() + 2 + 2 * overhead;
+    std::string().swap(navigationHistory.front().path);
+    std::string().swap(navigationHistory.front().query);
+    navigationHistory.erase(navigationHistory.begin());
+  }
+  navigationHistory.reserve(MAX_NAVIGATION_HISTORY);
+  navigationHistory.push_back({currentPath, searchQuery, feedWindow, forwardPage});
+  LOG_DBG("OPDS", "Navigation history %u/%u, budget %u bytes", static_cast<unsigned>(navigationHistory.size()),
+          static_cast<unsigned>(MAX_NAVIGATION_HISTORY), static_cast<unsigned>(MAX_HISTORY_BYTES));
+  return true;
+}
+
+void OpdsBookBrowserActivity::nextPage() {
+  if (!moreFeedEntries) {
+    followPageLink(pageNextHref, true);
+    return;
+  }
+  feedWindow.start = nextEntryOffset;
+  feedWindow.end = SIZE_MAX;
+  startBrowse();
+}
+
+void OpdsBookBrowserActivity::previousPage() {
+  if (feedWindow.start > 0) {
+    feedWindow.mode = OpdsWindowMode::Previous;
+    startBrowse();
+    return;
+  }
+  if (!navigationHistory.empty() && navigationHistory.back().forwardPage)
+    navigateBack();
+  else
+    followPageLink(pagePrevHref, false, OpdsWindowMode::Previous);
 }
 
 void OpdsBookBrowserActivity::setSearchQuery(const std::string& query) {
@@ -192,6 +257,10 @@ const char* OpdsBookBrowserActivity::browserTitle() const {
 void OpdsBookBrowserActivity::buildScreen(UiScreen& screen) {
   screenHeader(screen, browserTitle());
   if (buildStatusScreen(screen, /*boldError=*/false, /*showDownloadTotal=*/true)) return;
+  if (moreFeedEntries) {
+    const auto band = screen.takeTop(screen.target().lineHeight(screen.theme().smallText.font));
+    screen.target().text(band, tr(STR_OPDS_MORE_ENTRIES), screen.theme().smallText);
+  }
   buildBrowsingScreen(screen);
 }
 
@@ -204,16 +273,16 @@ void OpdsBookBrowserActivity::buildPaginationBar(UiScreen& screen) {
   fui::TabItem left[2], right[2];
   int lc = 0, rc = 0;
   const auto addTab = [](fui::TabItem* tabs, int& count, const freeink::Icon& icon, const int16_t value,
-                         const std::string& href) {
+                         const bool enabled) {
     tabs[count].icon = fui::bitmapFromIcon(icon);
     tabs[count].value = value;
-    tabs[count].enabled = !href.empty();
+    tabs[count].enabled = enabled;
     ++count;
   };
-  if (!pageFirstHref.empty()) addTab(left, lc, icon_page_first_32, PAGE_FIRST, pageFirstHref);
-  addTab(left, lc, icon_page_prev_32, PAGE_PREV, pagePrevHref);
-  addTab(right, rc, icon_page_next_32, PAGE_NEXT, pageNextHref);
-  if (!pageLastHref.empty()) addTab(right, rc, icon_page_last_32, PAGE_LAST, pageLastHref);
+  if (!pageFirstHref.empty()) addTab(left, lc, icon_page_first_32, PAGE_FIRST, true);
+  addTab(left, lc, icon_page_prev_32, PAGE_PREV, hasPreviousPage());
+  addTab(right, rc, icon_page_next_32, PAGE_NEXT, hasNextPage());
+  if (!pageLastHref.empty()) addTab(right, rc, icon_page_last_32, PAGE_LAST, true);
 
   const auto& metrics = UITheme::getInstance().getMetrics();
   const fui::Rect band = screen.takeBottom(static_cast<int16_t>(metrics.tabBarHeight));
@@ -238,9 +307,13 @@ void OpdsBookBrowserActivity::buildPaginationBar(UiScreen& screen) {
   fui::tabBar(screen.frame(), fui::Rect{static_cast<int16_t>(barRect.right() - side - zoneW), slotY, zoneW, slotH},
               props);
 
-  if (pageCurrent > 0 && pageTotal > 0) {
-    char pageText[32];
-    snprintf(pageText, sizeof(pageText), "%d/%d", pageCurrent, pageTotal);
+  if ((pageCurrent > 0 && pageTotal > 0) || moreFeedEntries || visibleEntryStart > 0) {
+    char pageText[64];
+    if (moreFeedEntries || visibleEntryStart > 0)
+      snprintf(pageText, sizeof(pageText), tr(STR_OPDS_ENTRY_RANGE), static_cast<unsigned>(visibleEntryStart + 1),
+               static_cast<unsigned>(nextEntryOffset));
+    else
+      snprintf(pageText, sizeof(pageText), "%d/%d", pageCurrent, pageTotal);
     fui::TextStyle centered = screen.theme().smallText;
     centered.align = fui::TextAlign::Center;
     const int16_t lh = screen.target().lineHeight(centered.font);
@@ -252,11 +325,11 @@ void OpdsBookBrowserActivity::buildPaginationBar(UiScreen& screen) {
 
 void OpdsBookBrowserActivity::buildBrowsingScreen(UiScreen& screen) {
   // Reserve the pagination band before the list claims the remaining height.
-  if (!pageNextHref.empty() || !pagePrevHref.empty() || !pageFirstHref.empty() || !pageLastHref.empty()) {
+  if (hasNextPage() || hasPreviousPage() || !pageFirstHref.empty() || !pageLastHref.empty()) {
     buildPaginationBar(screen);
   }
 
-  if (entries.empty()) {
+  if (entryCount() == 0) {
     screen.centeredText(tr(STR_NO_ENTRIES), screen.theme().bodyText);
     return;
   }
@@ -278,9 +351,9 @@ void OpdsBookBrowserActivity::drawFooter() {
   switch (state) {
     case State::BROWSING: {
       const char* confirmLabel = tr(STR_OPEN);
-      if (!entries.empty() && nav.selected >= 0 && nav.selected < static_cast<int>(entries.size()) &&
-          entries[nav.selected].type == OpdsEntryType::BOOK) {
-        confirmLabel = entries[nav.selected].purchase ? tr(STR_OPDS_BUY) : tr(STR_DOWNLOAD);
+      if (entryCount() > 0 && nav.selected >= 0 && nav.selected < static_cast<int>(entryCount()) &&
+          entryAt(nav.selected).type == OpdsEntryType::BOOK) {
+        confirmLabel = entryAt(nav.selected).purchase ? tr(STR_OPDS_BUY) : tr(STR_DOWNLOAD);
       }
       const char* searchLabel = (hasSearch() && nav.selected == 0) ? tr(STR_SEARCH) : tr(STR_DIR_UP);
       labels = mappedInput.mapLabels(tr(STR_BACK), confirmLabel, searchLabel, tr(STR_DIR_DOWN));
@@ -314,6 +387,33 @@ void OpdsBookBrowserActivity::downloadFinished(bool) {
   startBrowse();
 }
 
+void OpdsBookBrowserActivity::retryBrowse() {
+  if (!opdsTransport.invalidateFeed()) {
+    fail(StrId::STR_OPDS_FEED_STORAGE_ERROR);
+    return;
+  }
+  feedWindow = {};
+  startBrowse();
+}
+
+freeink::opds::OpdsClient::FetchStatus OpdsBookBrowserActivity::fetchWindow(const std::string& url,
+                                                                            OpdsWindowRequest& request,
+                                                                            OpdsFeedParser& parser) {
+  parser.setWindow(request);
+  auto status = opdsClient.fetchFeed(url, parser);
+  if (opdsClient.tokensDirty()) persistTokens();
+  if (status == freeink::opds::OpdsClient::FetchStatus::Ok && request.mode == OpdsWindowMode::Previous) {
+    request.start = parser.firstEntryOffset();
+    request.end = parser.nextEntryOffset();
+    request.mode = OpdsWindowMode::Forward;
+    parser.reset();
+    parser.setWindow(request);
+    status = opdsClient.fetchFeed(url, parser);
+    if (opdsClient.tokensDirty()) persistTokens();
+  }
+  return status;
+}
+
 void OpdsBookBrowserActivity::fetchFeed(const std::string& path) {
   if (server.url.empty()) {
     fail(StrId::STR_NO_SERVER_URL);
@@ -322,11 +422,22 @@ void OpdsBookBrowserActivity::fetchFeed(const std::string& path) {
 
   const std::string url = UrlUtils::buildUrl(server.url, path);
   OpdsFeedParser parser;
-  const auto status = opdsClient.fetchFeed(url, parser);
-  // The token state may have changed (renewed, or cleared on failure); persist
-  // only when an auth handshake actually ran.
-  if (opdsClient.tokensDirty()) persistTokens();
+  auto request = feedWindow;
+  request.bytesPerRow = sizeof(fui::ListItem);
+  const auto status = fetchWindow(url, request, parser);
   if (status != freeink::opds::OpdsClient::FetchStatus::Ok) {
+    const auto transportError = opdsTransport.feedError();
+    opdsTransport.invalidateFeed();
+    switch (transportError) {
+      case OpdsHttpTransport::FeedError::StorageFailure:
+        fail(StrId::STR_OPDS_FEED_STORAGE_ERROR);
+        return;
+      case OpdsHttpTransport::FeedError::MemoryFailure:
+        fail(StrId::STR_MEMORY_ERROR);
+        return;
+      case OpdsHttpTransport::FeedError::None:
+        break;
+    }
     switch (status) {
       case freeink::opds::OpdsClient::FetchStatus::CredentialsMissing:
         fail(StrId::STR_SET_CREDENTIALS_FIRST);
@@ -337,7 +448,11 @@ void OpdsBookBrowserActivity::fetchFeed(const std::string& path) {
       case freeink::opds::OpdsClient::FetchStatus::ParseFailed:
         fail(StrId::STR_PARSE_FEED_FAILED);
         break;
-      default:
+      case freeink::opds::OpdsClient::FetchStatus::MemoryError:
+        fail(StrId::STR_MEMORY_ERROR);
+        break;
+      case freeink::opds::OpdsClient::FetchStatus::Ok:
+      case freeink::opds::OpdsClient::FetchStatus::FetchFailed:
         fail(feedFailureMessage());
         break;
     }
@@ -366,25 +481,27 @@ void OpdsBookBrowserActivity::fetchFeed(const std::string& path) {
   pageCurrent = parser.currentPage();
   pageTotal = parser.pageCount();
   const bool feedTruncated = parser.truncated();
+  feedWindow = request;
+  visibleEntryStart = request.start;
+  previousWindowAvailable = request.start > 0 || (!navigationHistory.empty() && navigationHistory.back().forwardPage);
+  moreFeedEntries = parser.hasMoreEntries();
+  nextEntryOffset = parser.nextEntryOffset();
+  feedWindow.end = nextEntryOffset;
+  LOG_INF("OPDS", "Window %u..%u, more=%d, memory limited=%d", static_cast<unsigned>(feedWindow.start),
+          static_cast<unsigned>(nextEntryOffset), moreFeedEntries, parser.memoryLimited());
   // Reset the selection before the swap: the render task reads the selected
   // entry under only an empty() guard, and the new feed can be shorter than
   // the old selection.
   nav.reset();
   entries = parser.takeEntries();
 
-  // Pagination is a bottom tab bar (buildPaginationBar), not list rows.
-  auto facetRows = parser.takeFacetEntries();
-  entries.reserve(entries.size() + facetRows.size());
-  // Facet groups (sort orders, filters) come after the catalog content, each
-  // under its own section heading.
-  entries.insert(entries.end(), std::make_move_iterator(facetRows.begin()), std::make_move_iterator(facetRows.end()));
+  // Keep SDK vectors intact: merging them would briefly duplicate the largest allocation.
+  supplementaryEntries = parser.takeFacetEntries();
 
   // Standard OPDS user collections (loans, reading list, history), advertised
   // as feed-level links, become navigation rows under a "My Account" heading
-  // so they are reachable without pasting a URL. Authentication kicks in when
-  // one is opened. Only surfaced on the catalog root (no navigation history),
-  // since the same links repeat on every feed.
-  if (navigationHistory.empty()) {
+  // on the initial catalog feed, since these links repeat on every feed.
+  if (currentPath.empty()) {
     struct UserLink {
       const std::string& href;
       const char* label;  // tr()'d value; runtime StrId can't go through the macro
@@ -394,9 +511,21 @@ void OpdsBookBrowserActivity::fetchFeed(const std::string& path) {
         {parser.getWishlistUrl(), tr(STR_OPDS_WISHLIST)},
         {parser.getHistoryUrl(), tr(STR_OPDS_HISTORY)},
     };
+    size_t linksToAdd = 0;
+    for (const auto& link : userLinks)
+      if (!link.href.empty()) ++linksToAdd;
+    const size_t bytes = (supplementaryEntries.size() + linksToAdd) * sizeof(OpdsEntry);
+    const auto heap = HalMemory::getDefaultHeap();
+    if (linksToAdd && (heap.largestBlockBytes < bytes || heap.freeBytes <= bytes + 2048)) {
+      LOG_ERR("OPDS", "Insufficient account row memory: %u bytes", static_cast<unsigned>(bytes));
+      lock.unlock();
+      fail(StrId::STR_MEMORY_ERROR);
+      return;
+    }
+    if (linksToAdd) supplementaryEntries.reserve(supplementaryEntries.size() + linksToAdd);
     bool firstUserLink = true;
     for (const auto& link : userLinks) {
-      if (link.href.empty() || entries.size() >= OpdsLimits::MAX_ENTRIES) continue;
+      if (link.href.empty()) continue;
       OpdsEntry entry;
       entry.type = OpdsEntryType::NAVIGATION;
       entry.title = link.label;
@@ -405,17 +534,21 @@ void OpdsBookBrowserActivity::fetchFeed(const std::string& path) {
         entry.heading = tr(STR_OPDS_MY_ACCOUNT);
         firstUserLink = false;
       }
-      entries.push_back(std::move(entry));
+      supplementaryEntries.push_back(std::move(entry));
     }
   }
   if (feedTruncated) {
-    LOG_INF("OPDS", "Feed truncated to fit memory");
+    LOG_INF("OPDS", "Feed has continuation or omitted supplementary rows");
   }
 
   // Rows first: the render task reads rowItems once the state is BROWSING.
-  rebuildRowItems();
-  state = entries.empty() ? State::ERROR : State::BROWSING;
-  if (entries.empty()) errorMessage = tr(STR_NO_ENTRIES);
+  if (!rebuildRowItems()) {
+    lock.unlock();
+    fail(StrId::STR_MEMORY_ERROR);
+    return;
+  }
+  state = entryCount() == 0 ? State::ERROR : State::BROWSING;
+  if (entryCount() == 0) errorMessage = tr(STR_NO_ENTRIES);
   lock.unlock();
   requestUpdate();
 }
@@ -423,10 +556,17 @@ void OpdsBookBrowserActivity::fetchFeed(const std::string& path) {
 // Derives rowItems from entries. Called whenever entries changes
 // (fetchFeed()/releaseEntries()) so buildBrowsingScreen() reuses the cached
 // rows on every repaint instead of rebuilding them per render.
-void OpdsBookBrowserActivity::rebuildRowItems() {
+bool OpdsBookBrowserActivity::rebuildRowItems() {
   rowItems.clear();
-  rowItems.reserve(entries.size());
-  for (const auto& entry : entries) {
+  const size_t bytes = entryCount() * sizeof(fui::ListItem);
+  const auto heap = HalMemory::getDefaultHeap();
+  if (bytes && (heap.largestBlockBytes < bytes || heap.freeBytes <= bytes + 2048)) {
+    LOG_ERR("OPDS", "Insufficient list row memory: %u bytes", static_cast<unsigned>(bytes));
+    return false;
+  }
+  rowItems.reserve(entryCount());
+  for (size_t index = 0; index < entryCount(); ++index) {
+    const auto& entry = entryAt(index);
     fui::ListItem item;
     // A group's "see all" self link carries no title of its own; the UI
     // supplies the label (the group name is the section heading above it).
@@ -439,6 +579,7 @@ void OpdsBookBrowserActivity::rebuildRowItems() {
     item.actionValue = static_cast<int16_t>(rowItems.size());
     rowItems.push_back(item);
   }
+  return true;
 }
 
 // Callers outside onExit() (which already runs under the render lock) take the lock first: a
@@ -448,37 +589,48 @@ void OpdsBookBrowserActivity::releaseEntries() {
   // entries; stop routing touches against it until the next render.
   closeRouting();
   std::vector<OpdsEntry>().swap(entries);
+  std::vector<OpdsEntry>().swap(supplementaryEntries);
   std::vector<fui::ListItem>().swap(rowItems);
 }
 
-void OpdsBookBrowserActivity::navigateToEntry(const OpdsEntry& entry) {
-  navigationHistory.push_back(currentPath);
-  searchQueryHistory.push_back(searchQuery);
+void OpdsBookBrowserActivity::navigateToEntry(const OpdsEntry& entry, bool forwardPage, OpdsWindowMode mode) {
+  if (!savePosition(forwardPage)) return;
   // Following a results page (first/previous/next/last) stays within the
   // same search; any other navigation leaves it.
   if (!isPaginationHref(entry.href)) setSearchQuery("");
   // Resolve to a full URL so sub-sub-navigation retains parent path context
   const std::string feedUrl = UrlUtils::buildUrl(server.url, currentPath);
   currentPath = UrlUtils::buildUrl(feedUrl, entry.href);
+  feedWindow = {};
+  feedWindow.mode = mode;
+  if (mode == OpdsWindowMode::Previous) feedWindow.start = SIZE_MAX;
 
   startBrowse();
 }
 
 void OpdsBookBrowserActivity::navigateBack() {
-  if (navigationHistory.empty() || mappedInput.getHeldTime() >= GO_HOME_MS) {
+  if (feedWindow.start > 0 && feedWindow.mode == OpdsWindowMode::Forward) {
+    previousPage();
+    return;
+  }
+  if (navigationHistory.empty()) {
     onGoHome();
     return;
   }
-  currentPath = navigationHistory.back();
+  auto position = std::move(navigationHistory.back());
   navigationHistory.pop_back();
-  if (!searchQueryHistory.empty()) {
-    setSearchQuery(searchQueryHistory.back());
-    searchQueryHistory.pop_back();
-  }
+  currentPath = std::move(position.path);
+  setSearchQuery(position.query);
+  feedWindow = position.window;
   startBrowse();
 }
 
-void OpdsBookBrowserActivity::onBackButton() { navigateBack(); }
+void OpdsBookBrowserActivity::onBackButton() {
+  if (mappedInput.getHeldTime() >= GO_HOME_MS)
+    onGoHome();
+  else
+    navigateBack();
+}
 
 // SD destination from the configured download folder + filename format.
 std::string OpdsBookBrowserActivity::downloadDestination(const OpdsEntry& book) const {
@@ -1039,10 +1191,10 @@ void OpdsBookBrowserActivity::performSearch(const std::string& query) {
       searchTemplateBase.empty() ? UrlUtils::buildUrl(server.url, currentPath) : searchTemplateBase;
   const std::string url = UrlUtils::buildUrl(base, expanded);
 
-  navigationHistory.push_back(currentPath);
-  searchQueryHistory.push_back(searchQuery);
+  if (!savePosition(false)) return;
   setSearchQuery(query);
   currentPath = url;
+  feedWindow = {};
 
   startBrowse();
 }
